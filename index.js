@@ -9,16 +9,68 @@ import cors from "cors";
 dotenv.config();
 
 const app = express();
-
-// IMPORTANTE: Para la verificación del webhook Stripe necesita el body raw.
-// Usaremos bodyParser.raw() solo en la ruta /api/webhook.
-// Para todo lo demás usamos express.json().
 app.use(cors());
-app.use(express.json());
+
+// NO usar express.json() antes del webhook
+// Stripe necesita el body sin parsear en /api/webhook
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2022-11-15" });
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+// Usamos → SUPABASE_KEY para conactar el servicio con supabase
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+//  Webhook primero (para que reciba raw body)
+app.post(
+  "/api/webhook",
+  bodyParser.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.error(" Error verificación webhook:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      switch (event.type) {
+        case "payment_intent.succeeded": {
+          const pi = event.data.object;
+          console.log(" Pago exitoso:", pi.id);
+
+          await supabase
+            .from("pagos")
+            .update({ estado: "pagado", fecha_confirmacion: new Date().toISOString() })
+            .eq("payment_intent_id", pi.id);
+          break;
+        }
+
+        case "payment_intent.payment_failed": {
+          const pi = event.data.object;
+          console.log(" Pago fallido:", pi.id);
+          await supabase
+            .from("pagos")
+            .update({ estado: "fallido" })
+            .eq("payment_intent_id", pi.id);
+          break;
+        }
+
+        default:
+          console.log(`Evento no manejado: ${event.type}`);
+      }
+    } catch (err) {
+      console.error("Error al procesar evento:", err);
+      return res.status(500).send();
+    }
+
+    res.json({ received: true });
+  }
+);
+
+// Después del webhook puedes usar JSON normalmente
+app.use(express.json());
 
 // Endpoint para crear el PaymentIntent
 app.post("/api/pagos", async (req, res) => {
@@ -29,15 +81,13 @@ app.post("/api/pagos", async (req, res) => {
       return res.status(400).json({ error: "usuario_id y monto son requeridos" });
     }
 
-    // Crear PaymentIntent en Stripe
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(monto * 100), // monto en centavos
+      amount: Math.round(monto * 100),
       currency: "cop",
       automatic_payment_methods: { enabled: true },
       metadata: { usuario_id, descripcion: descripcion || "" },
     });
 
-    // Registrar intento en Supabase (tabla 'pagos')
     await supabase.from("pagos").insert([
       {
         usuario_id,
@@ -54,59 +104,7 @@ app.post("/api/pagos", async (req, res) => {
   }
 });
 
-// Endpoint para webhook (Stripe requiere raw body)
-app.post(
-  "/api/webhook",
-  bodyParser.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
-
-    try {
-      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-      console.error(" Error verificación webhook:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    // Manejar eventos relevantes
-    try {
-      switch (event.type) {
-        case "payment_intent.succeeded": {
-          const pi = event.data.object;
-          console.log("Pago exitoso:", pi.id);
-
-          // Actualizar registro en Supabase
-          await supabase
-            .from("pagos")
-            .update({ estado: "pagado", fecha_confirmacion: new Date().toISOString() })
-            .eq("payment_intent_id", pi.id);
-
-          break;
-        }
-        case "payment_intent.payment_failed": {
-          const pi = event.data.object;
-          console.log("Pago fallido:", pi.id);
-          await supabase
-            .from("pagos")
-            .update({ estado: "fallido" })
-            .eq("payment_intent_id", pi.id);
-          break;
-        }
-        default:
-          console.log(`Evento no manejado: ${event.type}`);
-      }
-    } catch (err) {
-      console.error("Error al procesar evento:", err);
-      // Responder 200 para no reintentar indefinidamente; maneja reintentos si necesario
-      return res.status(500).send();
-    }
-
-    res.json({ received: true });
-  }
-);
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Microservicio corriendo en puerto ${PORT}`);
+  console.log(` Microservicio corriendo en puerto ${PORT}`);
 });
